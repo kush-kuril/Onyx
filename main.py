@@ -213,6 +213,9 @@ class PopupWindow(QWidget):
             return
 
         self.chat_history.append({"role": "user", "content": prompt})
+        
+        # Clear the input box immediately after reading the prompt
+        self.line_edit.clear()
 
         self.is_streaming = True
         self.text_edit.clear()
@@ -221,6 +224,7 @@ class PopupWindow(QWidget):
         stream_thread = threading.Thread(target=self.stream_prompt, args=(prompt,))
         stream_thread.daemon = True
         stream_thread.start()
+
 
     def stream_prompt(self, prompt):
         """Background thread. Reads self.chat_history (safe because the
