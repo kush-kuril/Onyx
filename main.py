@@ -3,6 +3,7 @@ import signal
 import threading
 from PyQt6.QtWidgets import QApplication, QWidget, QLineEdit, QTextEdit, QVBoxLayout
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt6.QtGui import QTextCursor
 from pynput import keyboard
 from openai import OpenAI
 
@@ -20,11 +21,12 @@ MODEL_NAME = "qwen3-coder-30b-a3b-instruct"
 MAX_HISTORY_MESSAGES = 24
 
 
+
 def get_loaded_model(fallback=MODEL_NAME):
     """Ask LM Studio which model is currently loaded instead of hardcoding
-    one. This means switching models in LM Studio's UI — Qwen, Gemma,
-    anything else — just works without editing this file at all.
-    """
+        one. This means switching models in LM Studio's UI — Qwen, Gemma,
+        anything else — just works without editing this file at all.
+        """
     try:
         client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
         models = client.models.list()
@@ -38,6 +40,7 @@ def get_loaded_model(fallback=MODEL_NAME):
     return fallback
 
 
+
 class PopupToggleSignal(QObject):
     """QObject that emits a signal when the hotkey is pressed.
     This is needed because Qt GUI operations (like showing/hiding widgets)
@@ -47,6 +50,7 @@ class PopupToggleSignal(QObject):
     between the hotkey listener thread and the main GUI thread.
     """
     toggle_signal = pyqtSignal()
+
 
 
 class StreamUpdateSignal(QObject):
@@ -60,19 +64,26 @@ class StreamUpdateSignal(QObject):
     stream_finished = pyqtSignal(str)
 
 
+
 class PopupWindow(QWidget):
     def __init__(self, toggle_signal):
         super().__init__()
         self.toggle_signal = toggle_signal
         self.stream_signals = StreamUpdateSignal()
 
+
         # chat_history lives on the PopupWindow instance, created once in
         # __main__ and never recreated on hide/show — so it persists across
         # Escape/hotkey cycles and only resets when the process restarts.
         self.chat_history = []
 
+
         # Phase 1 guard: only one request in flight at a time.
         self.is_streaming = False
+        
+        # Add the response buffer
+        self.current_response_buffer = ""
+
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
@@ -80,7 +91,9 @@ class PopupWindow(QWidget):
             Qt.WindowType.Tool
         )
 
+
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
 
         self.setStyleSheet("""
             QWidget {
@@ -110,21 +123,26 @@ class PopupWindow(QWidget):
             }
         """)
 
+
         layout = QVBoxLayout()
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(10)
+
 
         self.line_edit = QLineEdit()
         self.line_edit.setPlaceholderText("Read to ask bro?")
         self.text_edit = QTextEdit()
         self.text_edit.setPlaceholderText("output here bro")
 
+
         layout.addWidget(self.line_edit)
         layout.addWidget(self.text_edit)
+
 
         self.setLayout(layout)
         self.position_top_right()
         self._enable_cross_space_overlay()
+
 
         self.animation = QPropertyAnimation(self, b"windowOpacity")
         self.animation.setDuration(200)
@@ -132,11 +150,13 @@ class PopupWindow(QWidget):
         self.animation.setEndValue(1.0)
         self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
 
+
         self.toggle_signal.toggle_signal.connect(self.show_popup)
         self.stream_signals.chunk_received.connect(self.append_to_text_edit)
         self.stream_signals.stream_finished.connect(self.stream_complete)
         self.line_edit.returnPressed.connect(self.handle_enter_key)
         self.hide()
+
 
     def center_on_screen(self):
         primary_screen = QApplication.primaryScreen().geometry()
@@ -146,6 +166,7 @@ class PopupWindow(QWidget):
         y = (primary_screen.height() - window_height) // 2
         self.setGeometry(x, y, window_width, window_height)
 
+
     def position_top_right(self):
         primary_screen = QApplication.primaryScreen().availableGeometry()
         window_width = 400
@@ -153,6 +174,7 @@ class PopupWindow(QWidget):
         x = primary_screen.width() - window_width - 20
         y = 20
         self.setGeometry(x, y, window_width, window_height)
+
 
     def _enable_cross_space_overlay(self):
         """Visible across every macOS Space and over full-screen apps,
@@ -171,9 +193,10 @@ class PopupWindow(QWidget):
                     NSWindowCollectionBehaviorCanJoinAllSpaces |
                     NSWindowCollectionBehaviorFullScreenAuxiliary
                 )
-                ns_window.setLevel_(NSPopUpMenuWindowLevel)
+            ns_window.setLevel_(NSPopUpMenuWindowLevel)
         except Exception as e:
             print(f"[Overlay] Native macOS overlay behavior not applied: {e}")
+
 
     def show_popup(self):
         self.show()
@@ -181,8 +204,20 @@ class PopupWindow(QWidget):
         self.activateWindow()
         self.animation.start()
 
+
     def append_to_text_edit(self, text):
-        self.text_edit.insertPlainText(text)
+        # Append to the buffer
+        self.current_response_buffer += text
+        
+        # Update the text edit with markdown
+        self.text_edit.setMarkdown(self.current_response_buffer)
+        
+        # Move cursor to the end and scroll to bottom
+        cursor = self.text_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.text_edit.setTextCursor(cursor)
+        self.text_edit.verticalScrollBar().setValue(self.text_edit.verticalScrollBar().maximum())
+
 
     def stream_complete(self, full_response):
         """Main thread only. The sole place that mutates chat_history and
@@ -190,19 +225,22 @@ class PopupWindow(QWidget):
         self.is_streaming = False
         if full_response:
             self.chat_history.append({"role": "assistant", "content": full_response})
-            # Phase 4: trim oldest messages once we're over the cap, so
-            # requests don't keep growing and eventually blow the context window.
-            if len(self.chat_history) > MAX_HISTORY_MESSAGES:
-                self.chat_history = self.chat_history[-MAX_HISTORY_MESSAGES:]
+        # Phase 4: trim oldest messages once we're over the cap, so
+        # requests don't keep growing and eventually blow the context window.
+        if len(self.chat_history) > MAX_HISTORY_MESSAGES:
+            self.chat_history = self.chat_history[-MAX_HISTORY_MESSAGES:]
         self.text_edit.append("\n--- Stream completed ---")
+
 
     def handle_enter_key(self):
         if self.is_streaming:
             return
 
+
         prompt = self.line_edit.text().strip()
         if not prompt:
             return
+
 
         # Handle reset commands
         if prompt.lower() in ["/clear", "/reset"]:
@@ -212,14 +250,20 @@ class PopupWindow(QWidget):
             self.text_edit.append("--- Chat history cleared ---")
             return
 
+
         self.chat_history.append({"role": "user", "content": prompt})
-        
+
+
         # Clear the input box immediately after reading the prompt
         self.line_edit.clear()
 
+        # Set the response buffer with markdown formatting
+        self.current_response_buffer = f"**Prompt:** {prompt}\n\n"
+        
+        # Update the text edit with markdown
+        self.text_edit.setMarkdown(self.current_response_buffer)
+
         self.is_streaming = True
-        self.text_edit.clear()
-        self.text_edit.append(f"Prompt: {prompt}\n")
 
         stream_thread = threading.Thread(target=self.stream_prompt, args=(prompt,))
         stream_thread.daemon = True
@@ -255,6 +299,7 @@ class PopupWindow(QWidget):
             self.stream_signals.chunk_received.emit(error_msg)
             self.stream_signals.stream_finished.emit("")
 
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.line_edit.clear()
@@ -263,17 +308,21 @@ class PopupWindow(QWidget):
         else:
             super().keyPressEvent(event)
 
+
     def start_hotkey_listener(self, toggle_signal_obj):
         pressed_keys = set()
         hotkey = {keyboard.Key.cmd, keyboard.Key.shift, keyboard.KeyCode.from_char('k')}
+
 
         def on_press(key):
             pressed_keys.add(key)
             if hotkey.issubset(pressed_keys):
                 toggle_signal_obj.toggle_signal.emit()
 
+
         def on_release(key):
             pressed_keys.discard(key)
+
 
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         listener.daemon = True
@@ -281,17 +330,21 @@ class PopupWindow(QWidget):
         return listener
 
 
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
 
     toggle_signal_obj = PopupToggleSignal()
     popup = PopupWindow(toggle_signal_obj)
     hotkey_listener = popup.start_hotkey_listener(toggle_signal_obj)
 
+
     signal.signal(signal.SIGINT, lambda sig, frame: app.quit())
     keep_alive_timer = QTimer()
     keep_alive_timer.timeout.connect(lambda: None)
     keep_alive_timer.start(200)
+
 
     sys.exit(app.exec())
